@@ -137,33 +137,87 @@ func formatPEM(key, keyType string) string {
 	return fmt.Sprintf("-----BEGIN %s-----\n%s\n-----END %s-----", keyType, key, keyType)
 }
 
+// combinedVerifier tries each verifier in order until one succeeds.
+type combinedVerifier struct {
+	verifiers []core.Verifier
+}
+
+func (c *combinedVerifier) Verify(ctx context.Context, serial, message, signature string) error {
+	for _, v := range c.verifiers {
+		if err := v.Verify(ctx, serial, message, signature); err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("verify failed: no verifier accepted serial=%s", serial)
+}
+
 func (w *Wxpay) ensureClient() (*core.Client, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.coreClient != nil {
 		return w.coreClient, nil
 	}
+
+	// 1. Load merchant private key
 	privateKey, err := utils.LoadPrivateKey(formatPEM(w.config["privateKey"], "PRIVATE KEY"))
 	if err != nil {
 		return nil, infraerrors.BadRequest("WXPAY_CONFIG_INVALID_KEY", "invalid_key").
 			WithMetadata(map[string]string{"key": "privateKey"})
 	}
-	publicKey, err := utils.LoadPublicKey(formatPEM(w.config["publicKey"], "PUBLIC KEY"))
+
+	// 2. Load WeChat Pay public key (public key mode)
+	wechatpayPublicKey, err := utils.LoadPublicKey(formatPEM(w.config["publicKey"], "PUBLIC KEY"))
 	if err != nil {
 		return nil, infraerrors.BadRequest("WXPAY_CONFIG_INVALID_KEY", "invalid_key").
 			WithMetadata(map[string]string{"key": "publicKey"})
 	}
-	verifier := verifiers.NewSHA256WithRSAPubkeyVerifier(w.config["publicKeyId"], *publicKey)
+	publicKeyID := w.config["publicKeyId"] // should start with "PUB_KEY_ID_"
+
+	// 3. Public key verifier (for requests signed with public key ID)
+	pubkeyVerifier := verifiers.NewSHA256WithRSAPubkeyVerifier(publicKeyID, *wechatpayPublicKey)
+
+	// 4. Certificate verifier (fallback for platform certificates, used during gray release)
+	certVisitor, err := core.NewCertificateVisitor(
+		core.WithDownloader(core.NewCertificateDownloader(
+			w.config["mchId"],
+			w.config["certSerial"], // merchant API certificate serial number
+			privateKey,
+			w.config["apiV3Key"],
+		)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create certificate visitor: %w", err)
+	}
+	certVerifier := verifiers.NewSHA256WithRSAVerifier(certVisitor)
+
+	// 5. Combined verifier: try public key first, then certificate
+	verifier := &combinedVerifier{
+		verifiers: []core.Verifier{pubkeyVerifier, certVerifier},
+	}
+
+	// 6. Initialize client using the official WeChatPayPublicKeyAuthCipher option
+	//    This configures both merchant certificate and WeChatPay public key,
+	//    letting the SDK choose the correct signing method automatically.
 	client, err := core.NewClient(context.Background(),
-		option.WithMerchantCredential(w.config["mchId"], w.config["certSerial"], privateKey),
-		option.WithVerifier(verifier))
+		option.WithWechatPayPublicKeyAuthCipher(
+			w.config["mchId"],
+			w.config["certSerial"],
+			privateKey,
+			publicKeyID,
+			wechatpayPublicKey,
+		),
+		option.WithVerifier(verifier), // important: use combined verifier for notification verification
+	)
 	if err != nil {
 		return nil, fmt.Errorf("wxpay init client: %w", err)
 	}
+
+	// 7. Notification handler also uses the combined verifier
 	handler, err := notify.NewRSANotifyHandler(w.config["apiV3Key"], verifier)
 	if err != nil {
 		return nil, fmt.Errorf("wxpay init notify handler: %w", err)
 	}
+
 	w.notifyHandler = handler
 	w.coreClient = client
 	return w.coreClient, nil
