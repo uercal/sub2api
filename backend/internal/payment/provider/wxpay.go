@@ -139,20 +139,6 @@ func formatPEM(key, keyType string) string {
 	return fmt.Sprintf("-----BEGIN %s-----\n%s\n-----END %s-----", keyType, key, keyType)
 }
 
-// combinedVerifier tries each verifier in order until one succeeds.
-type combinedVerifier struct {
-	verifiers []core.Verifier
-}
-
-func (c *combinedVerifier) Verify(ctx context.Context, serial, message, signature string) error {
-	for _, v := range c.verifiers {
-		if err := v.Verify(ctx, serial, message, signature); err == nil {
-			return nil
-		}
-	}
-	return fmt.Errorf("verify failed: no verifier accepted serial=%s", serial)
-}
-
 func (w *Wxpay) ensureClient() (*core.Client, error) {
     w.mu.Lock()
     defer w.mu.Unlock()
